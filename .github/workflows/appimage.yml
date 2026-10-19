@@ -5,7 +5,13 @@ on:
     branches: [main]
     tags: ["v*"]
   pull_request:
+  # Run by hand with a version to release it: the release and its tag
+  # v<version> are made here, on the commit the run is for.
   workflow_dispatch:
+    inputs:
+      release:
+        description: "Version to release, e.g. 0.1.0 (empty: just build)"
+        required: false
 
 permissions:
   contents: write
@@ -34,8 +40,11 @@ jobs:
             binutils zsync
 
       - name: Build
+        env:
+          RELEASE: ${{ inputs.release }}
         run: |
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then export VERSION="${GITHUB_REF_NAME#v}"; fi
+          if [[ -n "$RELEASE" ]]; then export VERSION="${RELEASE#v}"; fi
           ./build-appimage.sh
 
       - uses: actions/upload-artifact@v4
@@ -44,8 +53,10 @@ jobs:
           path: out/*
 
       - name: Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.release != ''
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', inputs.release) }}
+          target_commitish: ${{ github.sha }}
           files: out/*
           generate_release_notes: true

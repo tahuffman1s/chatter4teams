@@ -202,7 +202,9 @@ oldest system you want to support; the release workflow uses Ubuntu 22.04.
 
 Releases: push a tag `v<version>`, e.g. `v0.2.0`.
 `.github/workflows/appimage.yml` builds the AppImage with that version and
-attaches it and its `.zsync` file to a GitHub release. Pushes to `main` and
+attaches it and its `.zsync` file to a GitHub release. Or run the workflow
+by hand (Actions → AppImage → Run workflow) with a version such as `0.2.0`:
+it makes the release and its tag `v0.2.0` on the commit it builds. Pushes to `main` and
 pull requests build it as a workflow artifact.
 
 Running from source, without packaging: `pip install PyQt6`, then
