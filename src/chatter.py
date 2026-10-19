@@ -63,7 +63,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 APP_NAME = "Chatter"
 APP_ID = "chatter"
@@ -90,7 +90,9 @@ CFT_ZIP = "https://storage.googleapis.com/chrome-for-testing-public/{}/linux64/c
 # matches the window to the menu entry: panel launcher, icon, grouping.
 WM_CLASS = "chrome-teams.microsoft.com__-Default"
 MENU_ENTRY = os.path.join(DATA_HOME, "applications", f"{APP_ID}.desktop")
-MENU_ICON = os.path.join(DATA_HOME, "icons", "hicolor", "256x256", "apps", f"{APP_ID}.png")
+# (in Chatter's own data, not ~/.local/share/icons, which is the icon
+# theme's and can be read-only, as when home-manager links a theme there)
+MENU_ICON = os.path.join(DATA_HOME, APP_ID, f"{APP_ID}.png")
 AUTOSTART_ENTRY = os.path.join(CONFIG_HOME, "autostart", f"{APP_ID}.desktop")
 
 ACTIVITY_INTERVAL_MS = 20_000  # how often to pass the computer's activity on
@@ -1001,9 +1003,21 @@ def main():
 
     refresh_desktop_entries()
 
-    from PyQt6.QtCore import QObject, QRect, Qt, QTimer, pyqtSignal
-    from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPen, QPixmap
-    from PyQt6.QtWidgets import QApplication, QMenu, QMessageBox, QProgressDialog, QSystemTrayIcon
+    try:
+        from PyQt6.QtCore import QObject, QRect, Qt, QTimer, pyqtSignal
+        from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPen, QPixmap
+        from PyQt6.QtWidgets import QApplication, QMenu, QMessageBox, QProgressDialog, QSystemTrayIcon
+    except ImportError as e:
+        # Qt takes OpenGL, X11, Wayland and font libraries from the system.
+        log(f"Qt could not start: {e}")
+        if os.path.exists("/etc/NIXOS"):
+            log("On NixOS, run AppImages through appimage-run, which provides the libraries they expect: "
+                "`appimage-run Chatter-*.AppImage`. To run them directly, set "
+                "programs.appimage = { enable = true; binfmt = true; }; in your configuration.")
+        else:
+            log("Install the missing library from your distribution (libGL.so.1 is in libgl1, mesa-libGL or "
+                "libglvnd).")
+        return 1
 
     class Bridge(QObject):
         event = pyqtSignal(str, object)

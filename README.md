@@ -96,6 +96,17 @@ that folder too if you want them gone.
     window back.
 - FUSE, which almost every desktop has. Where it's missing, run the image
   with `--appimage-extract-and-run`.
+- NixOS has no `/usr/lib`, so run AppImages through `appimage-run`, which
+  provides the libraries they expect, for Chatter and for the Chrome it
+  starts: `appimage-run Chatter-*.AppImage`. To run them directly as
+  `./Chatter-*.AppImage` (and from the app menu), set:
+
+  ```nix
+  programs.appimage = {
+    enable = true;
+    binfmt = true;
+  };
+  ```
 
 ## Extensions
 
