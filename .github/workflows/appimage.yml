@@ -6,10 +6,6 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
-    inputs:
-      chrome_version:
-        description: "Chrome for Testing version (empty: the current Stable)"
-        required: false
 
 permissions:
   contents: write
@@ -38,13 +34,9 @@ jobs:
             binutils zsync
 
       - name: Build
-        id: build
-        env:
-          CHROME_VERSION: ${{ inputs.chrome_version }}
         run: |
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then export VERSION="${GITHUB_REF_NAME#v}"; fi
           ./build-appimage.sh
-          echo "chrome=$(cat build/AppDir/opt/chrome/CHROME_VERSION)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -56,5 +48,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: out/*
-          body: "Bundles Chrome for Testing ${{ steps.build.outputs.chrome }}."
           generate_release_notes: true

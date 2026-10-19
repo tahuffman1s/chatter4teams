@@ -2,7 +2,8 @@
 
 Microsoft Teams for Linux, as one AppImage for any distribution: the Teams
 web app in its own Chrome window, with a tray icon that does what the
-Windows app's does. Chrome for Testing is bundled, so nothing else needs
+Windows app's does. Chatter runs Teams in Chrome for Testing, which it
+downloads at its first start and keeps up to date, so nothing else needs
 installing, and Chrome extensions work in it.
 
 Microsoft publishes no Linux Teams client. Wrappers built on other browser
@@ -50,24 +51,39 @@ Chatter is not affiliated with or endorsed by Microsoft.
    ./Chatter-*-x86_64.AppImage
    ```
 
-On first start, Chatter adds itself to your app menu. It updates that entry
+On first start, Chatter downloads Chrome for Testing (about 170 MB) from
+Google into `~/.local/share/chatter`, showing its progress. Then it adds
+itself to your app menu. It updates that entry
 each time it starts, so it follows the AppImage if you move or rename it.
 Turn the entry off with **Show in the app menu** in the tray menu. Turn
 **Start at login** on there too.
 
-Updates: the AppImage carries update information, so
-[AppImageUpdate](https://github.com/AppImageCommunity/AppImageUpdate) (or
-AppImageLauncher, Gear Lever, ...) can update it in place, downloading only
-what changed.
+Updates:
+
+- **Chrome**: Chatter checks for a newer Chrome for Testing Stable at start
+  and every 6 hours, and downloads it in the background. The new version
+  takes over at the next start; the tray menu offers **Restart** to switch
+  right away. The old version is deleted then. Set
+  `CHATTER_CHROME_VERSION` to pin one version instead.
+- **Chatter**: the AppImage carries update information, so
+  [AppImageUpdate](https://github.com/AppImageCommunity/AppImageUpdate) (or
+  AppImageLauncher, Gear Lever, ...) can update it in place, downloading
+  only what changed.
 
 To remove it, run `./Chatter-*.AppImage --uninstall`, then delete the
 AppImage. That removes the menu and autostart entries. Your sign-in and
-extensions stay in `~/.local/share/chatter`; delete that folder too if you
-want them gone.
+extensions stay in `~/.local/share/chatter`, with Chrome for Testing; delete
+that folder too if you want them gone.
 
 ### Requirements
 
 - x86_64 Linux. Chrome for Testing is only built for x86_64.
+- The libraries Chrome needs (NSS, GTK 3, ALSA, ...). Any desktop that runs
+  a browser has them.
+- Internet access to `googlechromelabs.github.io` and
+  `storage.googleapis.com`, for the Chrome downloads. Chatter uses the
+  system's CA certificates, so a company TLS proxy works if its CA is
+  installed.
 - glibc 2.35 or newer: Ubuntu 22.04, Debian 12, Fedora 36, openSUSE Leap
   15.6 / Tumbleweed, Arch, or newer.
 - A tray:
@@ -99,22 +115,23 @@ the command line, which regular Chrome no longer allows.
 
 ## The Chrome sandbox
 
-Inside an AppImage, Chrome can't use its setuid sandbox helper, because the
-image is mounted `nosuid`. It uses unprivileged user namespaces instead. Some
+Chrome for Testing has no setuid sandbox helper: it is unpacked in your home
+directory, not installed by root. It uses unprivileged user namespaces
+instead. Some
 systems turn those off, or restrict them: Ubuntu 23.10 and later restrict
 them through AppArmor. On those systems, Chatter starts Chrome with
 `--no-sandbox` and says so on stderr. That is what other Chromium-based
 AppImages do too.
 
-To keep the sandbox on Ubuntu 23.10 and later, allow user namespaces for the
-bundled Chrome with an AppArmor profile, then tell Chatter to keep the
+To keep the sandbox on Ubuntu 23.10 and later, allow user namespaces for
+Chatter's Chrome with an AppArmor profile, then tell Chatter to keep the
 sandbox. Create `/etc/apparmor.d/chatter`:
 
 ```
 abi <abi/4.0>,
 include <tunables/global>
 
-profile chatter-chrome /tmp/.mount_*/opt/chrome/chrome flags=(unconfined) {
+profile chatter-chrome @{HOME}/.local/share/chatter/chrome-for-testing/*/chrome-linux64/chrome flags=(unconfined) {
   userns,
   include if exists <local/chatter-chrome>
 }
@@ -132,6 +149,7 @@ environment instead, or turn the menu entry off and keep your own.
 | What | Where |
 | --- | --- |
 | Chrome profile: sign-in, extensions, settings | `~/.local/share/chatter/chrome` |
+| Chrome for Testing | `~/.local/share/chatter/chrome-for-testing/<version>` |
 | Unpacked extensions | `~/.config/chatter/extensions/<name>/` |
 | Chatter's own settings | `~/.config/chatter/settings.json` |
 | App menu entry | `~/.local/share/applications/chatter.desktop` |
@@ -143,7 +161,8 @@ Environment variables:
 | --- | --- |
 | `CHATTER_NO_SANDBOX` | `1` runs Chrome without its sandbox; `0` keeps the sandbox always |
 | `CHATTER_CHROME_FLAGS` | extra Chrome flags, e.g. `--ozone-platform=wayland` |
-| `CHATTER_CHROME` | a different Chrome binary |
+| `CHATTER_CHROME_VERSION` | a Chrome for Testing version to use and keep, e.g. `155.0.8059.84` ([versions](https://googlechromelabs.github.io/chrome-for-testing/)) |
+| `CHATTER_CHROME` | a different Chrome binary; no Chrome for Testing is downloaded |
 | `CHATTER_URL` | a different Teams URL; the default is `https://teams.microsoft.com/v2/` |
 | `CHATTER_PROFILE` | a different Chrome profile directory |
 
@@ -174,12 +193,11 @@ the DevTools pipe (`--remote-debugging-pipe`):
 
 The script:
 
-1. Downloads Chrome for Testing: the current Stable, or `CHROME_VERSION`.
-2. Freezes the tray app with its Python and Qt using PyInstaller, then
+1. Freezes the tray app with its Python and Qt using PyInstaller, then
    trims libraries the host should provide (`packaging/prune.py`).
-3. Packs everything with appimagetool.
+2. Packs it with appimagetool.
 
-It needs Python 3.10 or newer, `curl`, `unzip` and `readelf`. Build on the
+It needs Python 3.10 or newer, `curl` and `readelf`. Build on the
 oldest system you want to support; the release workflow uses Ubuntu 22.04.
 
 Releases: push a tag `v<version>`, e.g. `v0.2.0`.
@@ -188,5 +206,12 @@ attaches it and its `.zsync` file to a GitHub release. Pushes to `main` and
 pull requests build it as a workflow artifact.
 
 Running from source, without packaging: `pip install PyQt6`, then
-`python3 src/chatter.py`. That uses a Chrome or Chromium from your `PATH`,
-or the one `CHATTER_CHROME` names.
+`python3 src/chatter.py`. It downloads Chrome for Testing the same way, unless
+`CHATTER_CHROME` names a Chrome to use.
+
+## License
+
+Chatter is under the [MIT license](LICENSE). The AppImage also contains
+Python, Qt and PyQt6, which keep their own licenses: PyQt6 is GPLv3, so the
+AppImage as a whole is distributed under the GPLv3's terms. Chrome for
+Testing is downloaded from Google by each user and is not part of Chatter.

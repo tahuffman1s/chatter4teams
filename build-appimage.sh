@@ -1,47 +1,27 @@
 #!/usr/bin/env bash
 # Builds out/Chatter-<version>-x86_64.AppImage: the tray app (src/chatter.py)
-# frozen with PyInstaller, and Chrome for Testing beside it.
+# frozen with PyInstaller. Chrome for Testing is not in it: Chatter downloads
+# that at its first start.
 #
-#   VERSION         the app version (default: __version__ in src/chatter.py)
-#   CHROME_VERSION  a Chrome for Testing version, e.g. 141.0.7390.54
-#                   (default: the current one of CHROME_CHANNEL)
-#   CHROME_CHANNEL  Stable (default), Beta, Dev or Canary
-#   PYTHON          the Python to build with (default: python3)
+#   VERSION  the app version (default: __version__ in src/chatter.py)
+#   PYTHON   the Python to build with (default: python3)
 #
 # Chrome for Testing is built for x86_64 Linux only, so the AppImage is too.
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 
 VERSION=${VERSION:-$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' src/chatter.py)}
-CHROME_CHANNEL=${CHROME_CHANNEL:-Stable}
 PYTHON=${PYTHON:-python3}
 BUILD=build
 APPDIR=$BUILD/AppDir
 OUT=out
-CFT=https://googlechromelabs.github.io/chrome-for-testing
 APPIMAGETOOL_URL=https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
 UPDATE_INFO="gh-releases-zsync|tahuffman1s|chatter4teams|latest|Chatter-*-x86_64.AppImage.zsync"
 
 mkdir -p "$BUILD/cache" "$OUT"
 rm -rf "$APPDIR"
 
-# -- Chrome for Testing
-if [ -z "${CHROME_VERSION:-}" ]; then
-  CHROME_VERSION=$(curl -fsSL "$CFT/last-known-good-versions.json" |
-    "$PYTHON" -c 'import json, sys; print(json.load(sys.stdin)["channels"][sys.argv[1]]["version"])' "$CHROME_CHANNEL")
-fi
-echo "Chatter $VERSION with Chrome for Testing $CHROME_VERSION"
-zip=$BUILD/cache/chrome-linux64-$CHROME_VERSION.zip
-if [ ! -s "$zip" ]; then
-  curl -fL --retry 3 -o "$zip.part" \
-    "https://storage.googleapis.com/chrome-for-testing-public/$CHROME_VERSION/linux64/chrome-linux64.zip"
-  mv "$zip.part" "$zip"
-fi
-rm -rf "$BUILD/chrome-linux64"
-unzip -q "$zip" -d "$BUILD"
-mkdir -p "$APPDIR/opt"
-mv "$BUILD/chrome-linux64" "$APPDIR/opt/chrome"
-echo "$CHROME_VERSION" > "$APPDIR/opt/chrome/CHROME_VERSION"
+echo "Chatter $VERSION"
 
 # -- the tray app, frozen with its Python and Qt
 if [ ! -x "$BUILD/venv/bin/python" ]; then

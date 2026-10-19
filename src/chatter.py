@@ -3,7 +3,8 @@
 Windows app has.
 
 Teams is the web app in an app-mode Chrome window with a profile of its own
-(Chrome for Testing, bundled in the AppImage). Chrome's extensions work
+(Chrome for Testing, downloaded at the first start and kept up to date with
+Google's Stable releases). Chrome's extensions work
 there, so a password manager such as Proton Pass can answer the Microsoft
 passkey prompt, and Chrome's own "use a phone" QR code is there too. This
 owns that Chrome and drives it over the DevTools pipe:
@@ -37,9 +38,11 @@ Extensions: install them from the Chrome Web Store (tray menu > Extensions),
 or put unpacked ones, one directory each, in ~/.config/chatter/extensions;
 those load at the next start.
 
-Environment: CHATTER_CHROME, CHATTER_ICON (set by the AppImage), and the
-overrides CHATTER_URL, CHATTER_PROFILE, CHATTER_CHROME_FLAGS and
-CHATTER_NO_SANDBOX (1 to run Chrome without its sandbox, 0 to keep it).
+Environment: CHATTER_ICON (set by the AppImage), and the overrides
+CHATTER_CHROME (a Chrome to use instead), CHATTER_CHROME_VERSION (a Chrome
+for Testing version to pin), CHATTER_URL, CHATTER_PROFILE,
+CHATTER_CHROME_FLAGS and CHATTER_NO_SANDBOX (1 to run Chrome without its
+sandbox, 0 to keep it).
 """
 
 import argparse
@@ -50,11 +53,15 @@ import os
 import queue
 import select
 import shutil
+import ssl
+import stat
 import subprocess
 import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
+import zipfile
 
 __version__ = "0.1.0"
 
@@ -74,6 +81,11 @@ CONFIG_DIR = os.path.join(CONFIG_HOME, APP_ID)
 EXTENSIONS_DIR = os.path.join(CONFIG_DIR, "extensions")
 SETTINGS = os.path.join(CONFIG_DIR, "settings.json")
 
+# Chrome for Testing, one directory per version: <version>/chrome-linux64/.
+CFT_DIR = os.path.join(DATA_HOME, APP_ID, "chrome-for-testing")
+CFT_LATEST = "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json"
+CFT_ZIP = "https://storage.googleapis.com/chrome-for-testing-public/{}/linux64/chrome-linux64.zip"
+
 # As Chrome names app windows (chrome-<host>__-<profile dir>), so the desktop
 # matches the window to the menu entry: panel launcher, icon, grouping.
 WM_CLASS = "chrome-teams.microsoft.com__-Default"
@@ -83,6 +95,7 @@ AUTOSTART_ENTRY = os.path.join(CONFIG_HOME, "autostart", f"{APP_ID}.desktop")
 
 ACTIVITY_INTERVAL_MS = 20_000  # how often to pass the computer's activity on
 ACTIVE_WITHIN_MS = 60_000  # ...when the last input was this recent
+UPDATE_CHECK_MS = 6 * 3600_000  # how often to look for a newer Chrome
 
 # Tray menu entries: the label, and the /command of last resort.
 STATUSES = [
@@ -183,21 +196,158 @@ def frozen():
     return getattr(sys, "frozen", False)
 
 
-def find_chrome():
-    """The bundled Chrome for Testing (CHATTER_CHROME, set by the AppImage),
-    or, run from source, a Chrome or Chromium on the PATH."""
-    chrome = os.environ.get("CHATTER_CHROME")
-    if chrome:
-        return chrome
-    for name in ("google-chrome-for-testing", "google-chrome-stable", "google-chrome", "chromium",
-                 "chromium-browser", "chrome"):
-        path = shutil.which(name)
-        if path:
-            return path
-    return "chromium"
+# -- Chrome for Testing: downloaded at the first start into CFT_DIR, and a
+# newer Stable fetched in the background, taking over at the next start.
+
+def version_key(version):
+    try:
+        return tuple(int(part) for part in version.split("."))
+    except ValueError:
+        return None
 
 
-CHROME = find_chrome()
+def cft_chrome(version):
+    return os.path.join(CFT_DIR, version, "chrome-linux64", "chrome")
+
+
+def installed_versions():
+    """The complete installs, oldest first (an install is unpacked beside
+    its directory and renamed into place only when it is whole)."""
+    try:
+        names = os.listdir(CFT_DIR)
+    except OSError:
+        return []
+    found = [n for n in names if version_key(n) and os.access(cft_chrome(n), os.X_OK)]
+    return sorted(found, key=version_key)
+
+
+def installed_chrome():
+    """The Chrome to run, if there is one yet: CHATTER_CHROME, else the
+    pinned or the newest Chrome for Testing that is installed."""
+    if os.environ.get("CHATTER_CHROME"):
+        return os.environ["CHATTER_CHROME"]
+    pinned = os.environ.get("CHATTER_CHROME_VERSION")
+    versions = installed_versions()
+    if pinned:
+        return cft_chrome(pinned) if pinned in versions else None
+    return cft_chrome(versions[-1]) if versions else None
+
+
+def managed_version(chrome):
+    """The Chrome for Testing version `chrome` is, if it is one of ours."""
+    rel = os.path.relpath(os.path.realpath(chrome), os.path.realpath(CFT_DIR))
+    version = rel.split(os.sep, 1)[0]
+    return version if not rel.startswith("..") and version_key(version) else None
+
+
+@functools.lru_cache(maxsize=None)
+def ssl_context():
+    """The system's certificates (so a company's own CA works too). The
+    frozen app's OpenSSL looks where the build machine keeps them, which
+    on another distribution is the wrong place."""
+    context = ssl.create_default_context()
+    for path in (os.environ.get("SSL_CERT_FILE"),
+                 "/etc/ssl/certs/ca-certificates.crt",  # Debian, Ubuntu, Arch, Gentoo
+                 "/etc/pki/tls/certs/ca-bundle.crt",  # Fedora, RHEL
+                 "/etc/ssl/ca-bundle.pem",  # openSUSE
+                 "/etc/ssl/cert.pem"):  # Alpine, Void
+        if path and os.path.isfile(path):
+            context.load_verify_locations(cafile=path)
+            break
+    return context
+
+
+def http_get(url, timeout=30):
+    request = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{__version__}"})
+    return urllib.request.urlopen(request, timeout=timeout, context=ssl_context())
+
+
+def wanted_chrome_version():
+    """The pinned version, or the current Stable."""
+    pinned = os.environ.get("CHATTER_CHROME_VERSION")
+    if pinned:
+        return pinned
+    with http_get(CFT_LATEST) as response:
+        return json.load(response)["channels"]["Stable"]["version"]
+
+
+class Cancelled(Exception):
+    pass
+
+
+def install_chrome(version, progress=None, cancelled=lambda: False):
+    """Download and unpack Chrome for Testing `version`; returns its chrome.
+    progress(done, total) gets the bytes so far (total 0 if unknown), then
+    (None, None) while unpacking."""
+    os.makedirs(CFT_DIR, exist_ok=True)
+    target = os.path.join(CFT_DIR, version)
+    archive = target + ".zip.part"
+    unpacked = target + ".part"
+    try:
+        with http_get(CFT_ZIP.format(version), timeout=60) as response, open(archive, "wb") as out:
+            total = int(response.headers.get("Content-Length") or 0)
+            done = 0
+            while chunk := response.read(1 << 20):
+                if cancelled():
+                    raise Cancelled()
+                out.write(chunk)
+                done += len(chunk)
+                if progress:
+                    progress(done, total)
+        if progress:
+            progress(None, None)
+        shutil.rmtree(unpacked, ignore_errors=True)
+        with zipfile.ZipFile(archive) as z:
+            for info in z.infolist():
+                path = z.extract(info, unpacked)
+                mode = stat.S_IMODE(info.external_attr >> 16)
+                if mode and not info.is_dir():
+                    os.chmod(path, mode)  # (zipfile drops the executable bits)
+        shutil.rmtree(target, ignore_errors=True)
+        os.rename(unpacked, target)
+    finally:
+        remove_file(archive)
+        shutil.rmtree(unpacked, ignore_errors=True)
+    return cft_chrome(version)
+
+
+def remove_other_chromes(keep):
+    """Every Chrome for Testing but `keep` (the one in use), and what an
+    interrupted download left."""
+    try:
+        names = os.listdir(CFT_DIR)
+    except OSError:
+        return
+    for name in names:
+        if name == keep:
+            continue
+        path = os.path.join(CFT_DIR, name)
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            remove_file(path)
+
+
+def update_chrome(current, notify):
+    """Fetch a Stable newer than `current` for the next start; notify
+    ("chrome_update", version) when it is there."""
+    try:
+        version = wanted_chrome_version()
+        if version_key(version) > version_key(current) and version not in installed_versions():
+            install_chrome(version)
+            notify("chrome_update", version)
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile) as e:
+        notify("error", f"looking for a newer Chrome for Testing: {e}")
+
+
+CHROME = installed_chrome()
+
+
+def use_chrome(path):
+    global CHROME
+    CHROME = path
+    sandbox_args.cache_clear()
+    chrome_args.cache_clear()
 
 
 def host_env():
@@ -227,15 +377,14 @@ def read_sysctl(name):
 
 @functools.lru_cache(maxsize=None)
 def sandbox_args():
-    """--no-sandbox where Chrome's sandbox can't work. Inside an AppImage the
-    setuid helper can't be setuid (the image is mounted nosuid), so Chrome
-    needs unprivileged user namespaces, which some distributions turn off or
+    """--no-sandbox where Chrome's sandbox can't work. Chrome for Testing,
+    unpacked in the home directory, has no setuid helper, so Chrome needs
+    unprivileged user namespaces, which some distributions turn off or
     restrict (Ubuntu 23.10 and later, through AppArmor)."""
     forced = os.environ.get("CHATTER_NO_SANDBOX")
     if forced is not None:
         return ["--no-sandbox"] if forced not in ("", "0") else []
-    appdir = os.environ.get("APPDIR")
-    if not appdir or not os.path.realpath(CHROME).startswith(os.path.realpath(appdir) + os.sep):
+    if not managed_version(CHROME):
         return []  # a Chrome of the system's has its own setuid sandbox
     reason = None
     if read_sysctl("kernel/apparmor_restrict_unprivileged_userns") == "1":
@@ -262,7 +411,10 @@ def unpacked_extensions():
 
 @functools.lru_cache(maxsize=None)
 def chrome_args():
-    args = [f"--user-data-dir={PROFILE}", "--no-first-run", "--no-default-browser-check", *sandbox_args()]
+    # --disable-infobars: no "Chrome for Testing is only for automated
+    # testing" bar (nor the --no-sandbox one) across the top of Teams.
+    args = [f"--user-data-dir={PROFILE}", "--no-first-run", "--no-default-browser-check", "--disable-infobars",
+            *sandbox_args()]
     extensions = unpacked_extensions()
     if extensions:
         args.append("--load-extension=" + ",".join(extensions))
@@ -841,21 +993,17 @@ def main():
     background = opts.background
     lock = single_instance()
     if lock is None:
-        # Already running: just ask it for the window. (That Chrome only
-        # hands the request over and exits; waiting for it keeps the
-        # AppImage mounted until it has.)
-        if not background:
-            try:
-                open_window().wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                pass
+        # Already running: just ask it for the window (unless it is still
+        # downloading Chrome).
+        if not background and CHROME:
+            open_window()
         return 0
 
     refresh_desktop_entries()
 
     from PyQt6.QtCore import QObject, QRect, Qt, QTimer, pyqtSignal
     from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPen, QPixmap
-    from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
+    from PyQt6.QtWidgets import QApplication, QMenu, QMessageBox, QProgressDialog, QSystemTrayIcon
 
     class Bridge(QObject):
         event = pyqtSignal(str, object)
@@ -867,7 +1015,10 @@ def main():
     app.setDesktopFileName(APP_ID)
 
     base = QPixmap(ICON) if ICON and os.path.exists(ICON) else QIcon.fromTheme("internet-chat").pixmap(64, 64)
-    state = {"badge": 0, "title_badge": 0, "presence": None, "window": False, "running": False}
+    state = {"badge": 0, "title_badge": 0, "presence": None, "window": False, "running": False,
+             "chrome_update": None}
+    restart = [False]
+    download = {}
 
     def draw_icon():
         size = 64
@@ -924,7 +1075,9 @@ def main():
         tray.setIcon(draw_icon())
         count = state["badge"] or state["title_badge"]
         parts = [APP_NAME]
-        if not state["running"]:
+        if not CHROME:
+            parts.append("downloading Chrome")
+        elif not state["running"]:
             parts.append("not running")
         else:
             if state["presence"]:
@@ -933,11 +1086,100 @@ def main():
         tray.setToolTip(" — ".join(parts))
         title.setText(" — ".join(parts[:2]))
         open_action.setText(f"Open {APP_NAME}" if state["running"] else f"Start {APP_NAME}")
+        open_action.setEnabled(bool(CHROME))
+        restart_action.setVisible(bool(state["chrome_update"]))
+        if state["chrome_update"]:
+            restart_action.setText(f"Restart to use Chrome {state['chrome_update']}")
         status_menu.setEnabled(state["running"])
         store_action.setEnabled(state["running"])
         manage_action.setEnabled(state["running"])
 
+    def emit(kind, value):
+        bridge.event.emit(kind, value)
+
+    def chrome_ready(path):
+        use_chrome(path)
+        controller.start()
+        version = managed_version(path)
+        if version:
+            remove_other_chromes(version)
+            if not os.environ.get("CHATTER_CHROME_VERSION"):
+                check_for_update()
+                update_timer.start(UPDATE_CHECK_MS)
+        refresh()
+
+    def check_for_update():
+        version = managed_version(CHROME)
+        threading.Thread(target=update_chrome, args=(version, emit), daemon=True).start()
+
+    def first_download():
+        """No Chrome yet: download Chrome for Testing, with a progress window."""
+        dialog = QProgressDialog(f"Downloading Chrome for Testing for {APP_NAME} (first start only)…", "Cancel", 0, 0)
+        dialog.setWindowTitle(APP_NAME)
+        dialog.setWindowIcon(QIcon(base))
+        dialog.setMinimumWidth(460)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        cancel = threading.Event()
+        dialog.canceled.connect(cancel.set)
+        download["dialog"] = dialog
+
+        def work():
+            try:
+                version = wanted_chrome_version()
+                emit("download_progress", (version, 0, 0))
+                path = install_chrome(version, lambda done, total: emit("download_progress", (version, done, total)),
+                                      cancel.is_set)
+                emit("download_done", path)
+            except Cancelled:
+                emit("download_failed", None)
+            except Exception as e:
+                emit("download_failed", str(e))
+
+        threading.Thread(target=work, daemon=True).start()
+        dialog.show()
+
+    def on_download(kind, value):
+        dialog = download["dialog"]
+        if kind == "download_progress":
+            version, done, total = value
+            if done is None:
+                dialog.setRange(0, 0)
+                dialog.setLabelText(f"Unpacking Chrome for Testing {version}…")
+            else:
+                mb = f"{done / 1e6:.0f} of {total / 1e6:.0f} MB" if total else f"{done / 1e6:.0f} MB"
+                dialog.setLabelText(f"Downloading Chrome for Testing {version} for {APP_NAME} "
+                                    f"(first start only): {mb}")
+                if total:
+                    dialog.setRange(0, total // 1024)
+                    dialog.setValue(done // 1024)
+            return
+        # (hide, not close: closing a progress dialog counts as Cancel)
+        dialog.hide()
+        dialog.deleteLater()
+        if kind == "download_done":
+            chrome_ready(value)
+        elif value is None:
+            app.quit()  # cancelled
+        else:
+            log(f"downloading Chrome for Testing: {value}")
+            box = QMessageBox(QMessageBox.Icon.Critical, APP_NAME,
+                              f"{APP_NAME} could not download Chrome for Testing, which it runs Teams in.\n\n{value}",
+                              QMessageBox.StandardButton.Retry | QMessageBox.StandardButton.Close)
+            if box.exec() == QMessageBox.StandardButton.Retry:
+                first_download()
+            else:
+                app.quit()
+
     def on_event(kind, value):
+        if kind.startswith("download_"):
+            on_download(kind, value)
+            return
+        if kind == "chrome_update":
+            tray.showMessage(APP_NAME, f"Chrome for Testing {value} is ready. It takes over when {APP_NAME} "
+                             "next starts, or now with Restart in the tray menu.",
+                             QSystemTrayIcon.MessageIcon.Information, 10_000)
         if kind in state:
             state[kind] = value
         elif kind == "error":
@@ -953,6 +1195,8 @@ def main():
 
     def start():
         nonlocal controller
+        if not CHROME:
+            return  # still downloading it
         if state["running"]:
             controller.send("open")
             return
@@ -1018,6 +1262,14 @@ def main():
     autostart_action.toggled.connect(toggled(set_autostart))
     menu.addAction(autostart_action)
     menu.addSeparator()
+    restart_action = QAction(QIcon.fromTheme("view-refresh"), "Restart", menu)
+
+    def restart_now():
+        restart[0] = True
+        quit_all()
+
+    restart_action.triggered.connect(restart_now)
+    menu.addAction(restart_action)
     quit_action = QAction(QIcon.fromTheme("application-exit"), f"Quit {APP_NAME}", menu)
 
     def quit_all():
@@ -1049,10 +1301,21 @@ def main():
     activity_timer.timeout.connect(pass_activity_on)
     activity_timer.start(ACTIVITY_INTERVAL_MS)
 
+    update_timer = QTimer()
+    update_timer.timeout.connect(check_for_update)
+
     refresh()
     tray.show()
-    controller.start()
-    return app.exec()
+    if CHROME:
+        chrome_ready(CHROME)
+    else:
+        first_download()
+    status = app.exec()
+    if restart[0]:
+        lock.close()
+        command = launch_command()
+        os.execv(command[0], command)
+    return status
 
 
 if __name__ == "__main__":
