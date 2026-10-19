@@ -1,0 +1,4 @@
+# What the AppImage build freezes; running from source needs only PyQt6.
+PyQt6==6.11.0
+PyQt6-Qt6==6.11.2
+pyinstaller==6.22.3

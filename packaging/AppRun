@@ -1,0 +1,8 @@
+#!/bin/sh
+# The AppImage's entry point: the tray app, pointed at the Chrome for Testing
+# that is bundled beside it.
+HERE=$(dirname "$(readlink -f "$0")")
+export APPDIR="${APPDIR:-$HERE}"
+export CHATTER_CHROME="${CHATTER_CHROME:-$HERE/opt/chrome/chrome}"
+export CHATTER_ICON="${CHATTER_ICON:-$HERE/chatter.png}"
+exec "$HERE/usr/lib/chatter/chatter" "$@"

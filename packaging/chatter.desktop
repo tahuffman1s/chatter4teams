@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Chatter
+GenericName=Team chat and calls
+Comment=Microsoft Teams in its own window, with a tray icon
+Exec=chatter
+Icon=chatter
+Terminal=false
+StartupNotify=true
+StartupWMClass=chrome-teams.microsoft.com__-Default
+Categories=Network;Chat;InstantMessaging;
+Keywords=Teams;Microsoft;Chat;Meeting;Call;
