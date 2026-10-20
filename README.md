@@ -121,6 +121,10 @@ The tray menu's **Extensions** submenu offers:
   Put each unpacked extension there in its own directory, the one that holds
   its `manifest.json`. Chatter loads them at its next start.
 
+The extensions page also lists **Chatter**: Chatter's own helper. It does
+nothing but wake at each start, so that Chrome lets Chatter keep Teams
+running while the window is closed. Chatter loads it every time.
+
 Chrome for Testing is used because it still loads unpacked extensions from
 the command line, which regular Chrome no longer allows.
 

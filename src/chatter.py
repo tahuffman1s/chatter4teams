@@ -46,6 +46,7 @@ sandbox, 0 to keep it).
 """
 
 import argparse
+import ctypes
 import fcntl
 import functools
 import json
@@ -53,6 +54,8 @@ import os
 import queue
 import select
 import shutil
+import signal
+import socket
 import ssl
 import stat
 import subprocess
@@ -63,7 +66,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 APP_NAME = "Chatter"
 APP_ID = "chatter"
@@ -79,6 +82,7 @@ CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config
 PROFILE = os.environ.get("CHATTER_PROFILE") or os.path.join(DATA_HOME, APP_ID, "chrome")
 CONFIG_DIR = os.path.join(CONFIG_HOME, APP_ID)
 EXTENSIONS_DIR = os.path.join(CONFIG_DIR, "extensions")
+HELPER_DIR = os.path.join(DATA_HOME, APP_ID, "helper-extension")
 SETTINGS = os.path.join(CONFIG_DIR, "settings.json")
 
 # Chrome for Testing, one directory per version: <version>/chrome-linux64/.
@@ -181,6 +185,22 @@ SET_STATUS_JS = r"""
   return "ok";
 })
 """
+
+
+# Chrome creates a hidden target only while it has some other DevTools
+# target (a page, a worker, ...), and with no window open there may be none:
+# its own extensions' workers run on the first start, not later. So this
+# extension, always loaded, has a worker that wakes at every browser start.
+HELPER_FILES = {
+    "manifest.json": json.dumps({
+        "manifest_version": 3,
+        "name": APP_NAME,
+        "version": "1",
+        "description": f"Part of {APP_NAME}: lets it keep Teams running while its window is closed.",
+        "background": {"service_worker": "worker.js"},
+    }, indent=2),
+    "worker.js": "chrome.runtime.onStartup.addListener(() => {});\n",
+}
 
 
 # A mouse move raised in the page (bubbles from body to document and window).
@@ -417,9 +437,7 @@ def chrome_args():
     # testing" bar (nor the --no-sandbox one) across the top of Teams.
     args = [f"--user-data-dir={PROFILE}", "--no-first-run", "--no-default-browser-check", "--disable-infobars",
             *sandbox_args()]
-    extensions = unpacked_extensions()
-    if extensions:
-        args.append("--load-extension=" + ",".join(extensions))
+    args.append("--load-extension=" + ",".join([HELPER_DIR, *unpacked_extensions()]))
     return [*args, *os.environ.get("CHATTER_CHROME_FLAGS", "").split()]
 
 
@@ -434,9 +452,47 @@ def open_window():
     return spawn([CHROME, *chrome_args(), f"--app={URL}"])
 
 
+def stop_orphaned_chrome():
+    """A Chrome that an earlier Chatter started and left running (it was
+    killed before it could close it) still holds the profile: a new Chrome
+    would hand over to it and exit. It is known by the profile's lock (its
+    host and pid) and by its command line: this profile, over a DevTools
+    pipe, which only Chatter gives it. (This runs holding Chatter's own
+    lock, so no other Chatter owns it.)"""
+    try:
+        host, _, pid = os.readlink(os.path.join(PROFILE, "SingletonLock")).rpartition("-")
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            # (Chrome rewrites its process title: by then this is its
+            # arguments joined with spaces, not separated with NULs)
+            cmdline = b" " + f.read().replace(b"\0", b" ") + b" "
+    except (OSError, ValueError):
+        return
+    if host != socket.gethostname() or not pid.isdigit():
+        return
+    if f" --user-data-dir={PROFILE} ".encode() not in cmdline or b" --remote-debugging-pipe " not in cmdline:
+        return
+    log(f"stopping the Chrome an earlier {APP_NAME} left running (pid {pid})")
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.kill(int(pid), sig)
+        except ProcessLookupError:
+            return
+        end = time.monotonic() + 10
+        while time.monotonic() < end and os.path.exists(f"/proc/{pid}"):
+            time.sleep(0.2)
+        if not os.path.exists(f"/proc/{pid}"):
+            return
+
+
 def prepare_profile():
-    """No "running in the background" tray icon of Chrome's own (the one
-    here is the one that matters): background mode off in Local State."""
+    """Before Chrome starts: the helper extension in place, no Chrome left
+    over on the profile, and no "running in the background" tray icon of
+    Chrome's own (the one here is the one that matters): background mode
+    off in Local State."""
+    os.makedirs(HELPER_DIR, exist_ok=True)
+    for name, text in HELPER_FILES.items():
+        write_file(os.path.join(HELPER_DIR, name), text)
+    stop_orphaned_chrome()
     os.makedirs(PROFILE, exist_ok=True)
     path = os.path.join(PROFILE, "Local State")
     try:
@@ -454,6 +510,10 @@ def prepare_profile():
     os.replace(path + ".chatter", path)
 
 
+libc = ctypes.CDLL(None, use_errno=True)
+PR_SET_PDEATHSIG = 1
+
+
 class DevTools:
     """Chrome over --remote-debugging-pipe (fds 3 and 4), one caller at a
     time. Events that arrive while waiting for a reply are queued."""
@@ -469,6 +529,9 @@ class DevTools:
         def child_fds():
             os.dup2(hi_r, 3)
             os.dup2(hi_w, 4)
+            # Chrome goes when Chatter does, however Chatter ends, rather
+            # than holding the profile with nothing to drive it.
+            libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
 
         self.proc = subprocess.Popen(
             [CHROME, *args], preexec_fn=child_fds, pass_fds=(3, 4), env=host_env(),
@@ -789,7 +852,7 @@ class Controller(threading.Thread):
         except (EOFError, OSError, RuntimeError, TimeoutError) as e:
             self.notify("running", False)
             if not self.quitting:
-                self.notify("error", f"Chrome stopped: {e}")
+                self.notify("failed", f"Chrome stopped: {e}")
         finally:
             if self.chrome and self.chrome.proc.poll() is None:
                 if not self.quitting:
@@ -1194,6 +1257,10 @@ def main():
             tray.showMessage(APP_NAME, f"Chrome for Testing {value} is ready. It takes over when {APP_NAME} "
                              "next starts, or now with Restart in the tray menu.",
                              QSystemTrayIcon.MessageIcon.Information, 10_000)
+        if kind == "failed":
+            tray.showMessage(APP_NAME, f"{value}. Click the tray icon to start again.",
+                             QSystemTrayIcon.MessageIcon.Warning, 10_000)
+            kind = "error"
         if kind in state:
             state[kind] = value
         elif kind == "error":
