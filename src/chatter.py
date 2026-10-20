@@ -38,7 +38,8 @@ Extensions: install them from the Chrome Web Store (tray menu > Extensions),
 or put unpacked ones, one directory each, in ~/.config/chatter/extensions;
 those load at the next start.
 
-Environment: CHATTER_ICON (set by the AppImage), and the overrides
+Environment: CHATTER_ICON and CHATTER_GTK_THEMES (set by the AppImage), and
+the overrides CHATTER_GTK_THEME (the GTK theme of Chrome's window frame),
 CHATTER_CHROME (a Chrome to use instead), CHATTER_CHROME_VERSION (a Chrome
 for Testing version to pin), CHATTER_URL, CHATTER_PROFILE,
 CHATTER_CHROME_FLAGS and CHATTER_NO_SANDBOX (1 to run Chrome without its
@@ -66,7 +67,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 APP_NAME = "Chatter"
 APP_ID = "chatter"
@@ -74,6 +75,9 @@ APP_ID = "chatter"
 URL = os.environ.get("CHATTER_URL", "https://teams.microsoft.com/v2/")
 ORIGIN = "{0.scheme}://{0.netloc}".format(urllib.parse.urlsplit(URL))
 ICON = os.environ.get("CHATTER_ICON", "")
+# A share/ directory with themes/adw-gtk3 and adw-gtk3-dark (set by the
+# AppImage): libadwaita's look for GTK 3, which Chrome draws its frame with.
+GTK_THEMES = os.environ.get("CHATTER_GTK_THEMES", "")
 WEB_STORE = "https://chromewebstore.google.com/"
 EXTENSIONS_PAGE = "chrome://extensions/"
 
@@ -389,6 +393,59 @@ def host_env():
     return env
 
 
+def prefers_dark():
+    """Whether the desktop prefers a dark style: the desktop portal's
+    color-scheme (GNOME, KDE and most others), else the GTK or KDE settings
+    files."""
+    try:
+        from PyQt6.QtDBus import QDBus, QDBusConnection, QDBusMessage
+
+        bus = QDBusConnection.sessionBus()
+        for method in ("ReadOne", "Read"):  # (Read: portals before version 2)
+            msg = QDBusMessage.createMethodCall("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
+                                                "org.freedesktop.portal.Settings", method)
+            msg.setArguments(["org.freedesktop.appearance", "color-scheme"])
+            reply = bus.call(msg, QDBus.CallMode.Block, 1000)
+            if reply.type() == QDBusMessage.MessageType.ErrorMessage or not reply.arguments():
+                continue
+            value = reply.arguments()[0]
+            while hasattr(value, "variant"):  # (Read wraps it twice)
+                value = value.variant()
+            if isinstance(value, int):
+                return value == 1  # 1: prefer dark, 2: prefer light, 0: no preference
+    except ImportError:
+        pass
+    for path, keys in ((os.path.join(CONFIG_HOME, "gtk-3.0", "settings.ini"),
+                        ("gtk-application-prefer-dark-theme", "gtk-theme-name")),
+                       (os.path.join(CONFIG_HOME, "kdeglobals"), ("ColorScheme",))):
+        try:
+            with open(path) as f:
+                for line in f:
+                    key, _, value = line.partition("=")
+                    value = value.strip().lower()
+                    if key.strip() in keys and (value in ("1", "true") or "dark" in value):
+                        return True
+        except OSError:
+            pass
+    return False
+
+
+def chrome_env():
+    """host_env(), and the GTK theme Chrome draws its window frame with:
+    adw-gtk3, libadwaita's look, light or dark as the desktop prefers
+    (CHATTER_GTK_THEME names another). The themes come last in the data
+    directories, so nothing of the system's is shadowed."""
+    env = host_env()
+    theme = os.environ.get("CHATTER_GTK_THEME")
+    if not theme and GTK_THEMES and os.path.isdir(os.path.join(GTK_THEMES, "themes", "adw-gtk3")):
+        theme = "adw-gtk3-dark" if prefers_dark() else "adw-gtk3"
+    if theme:
+        env["GTK_THEME"] = theme
+    if GTK_THEMES:
+        env["XDG_DATA_DIRS"] = f"{env.get('XDG_DATA_DIRS') or '/usr/local/share:/usr/share'}:{GTK_THEMES}"
+    return env
+
+
 def read_sysctl(name):
     try:
         with open(f"/proc/sys/{name}") as f:
@@ -441,15 +498,15 @@ def chrome_args():
     return [*args, *os.environ.get("CHATTER_CHROME_FLAGS", "").split()]
 
 
-def spawn(args):
-    return subprocess.Popen(args, env=host_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+def spawn(args, env=None):
+    return subprocess.Popen(args, env=env or host_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
 
 
 def open_window():
     """Ask the running Chrome for the app window (process singleton), or
     start one with it."""
-    return spawn([CHROME, *chrome_args(), f"--app={URL}"])
+    return spawn([CHROME, *chrome_args(), f"--app={URL}"], chrome_env())
 
 
 def stop_orphaned_chrome():
@@ -484,30 +541,50 @@ def stop_orphaned_chrome():
             return
 
 
+def update_json(path, values):
+    """Set `values` ({"a.b.c": value}) in the JSON file at `path`, which
+    Chrome must not have open; nothing is written if they are set already."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        data = {}
+    except (OSError, ValueError):
+        return
+    if not isinstance(data, dict):
+        return
+    changed = False
+    for dotted, value in values.items():
+        *parents, key = dotted.split(".")
+        node = data
+        for name in parents:
+            if not isinstance(node.get(name), dict):
+                node[name] = {}
+            node = node[name]
+        if node.get(key) != value:
+            node[key] = value
+            changed = True
+    if changed:
+        write_file(path, json.dumps(data))
+
+
 def prepare_profile():
     """Before Chrome starts: the helper extension in place, no Chrome left
-    over on the profile, and no "running in the background" tray icon of
-    Chrome's own (the one here is the one that matters): background mode
-    off in Local State."""
+    over on the profile, no "running in the background" tray icon of
+    Chrome's own (the one here is the one that matters), and the window
+    frame Chrome draws itself in the GTK theme (on KDE it would pick its Qt
+    theme, which needs a Qt of the system's, and fall back to its plain
+    one)."""
     os.makedirs(HELPER_DIR, exist_ok=True)
     for name, text in HELPER_FILES.items():
         write_file(os.path.join(HELPER_DIR, name), text)
     stop_orphaned_chrome()
-    os.makedirs(PROFILE, exist_ok=True)
-    path = os.path.join(PROFILE, "Local State")
-    try:
-        with open(path) as f:
-            state = json.load(f)
-    except FileNotFoundError:
-        state = {}
-    except (OSError, ValueError):
-        return
-    if not isinstance(state, dict) or state.get("background_mode", {}).get("enabled") is False:
-        return
-    state.setdefault("background_mode", {})["enabled"] = False
-    with open(path + ".chatter", "w") as f:
-        json.dump(state, f)
-    os.replace(path + ".chatter", path)
+    os.makedirs(os.path.join(PROFILE, "Default"), exist_ok=True)
+    update_json(os.path.join(PROFILE, "Local State"), {"background_mode.enabled": False})
+    update_json(os.path.join(PROFILE, "Default", "Preferences"), {
+        "extensions.theme.system_theme": 1,  # GTK (0: Chrome's own, 2: Qt)
+        "browser.custom_chrome_frame": True,  # Chrome's frame, not the window manager's
+    })
 
 
 libc = ctypes.CDLL(None, use_errno=True)
@@ -534,7 +611,7 @@ class DevTools:
             libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
 
         self.proc = subprocess.Popen(
-            [CHROME, *args], preexec_fn=child_fds, pass_fds=(3, 4), env=host_env(),
+            [CHROME, *args], preexec_fn=child_fds, pass_fds=(3, 4), env=chrome_env(),
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         os.close(hi_r)
         os.close(hi_w)

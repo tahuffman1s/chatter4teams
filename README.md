@@ -40,6 +40,20 @@ Chatter is not affiliated with or endorsed by Microsoft.
   hands notifications to your desktop. Notifications, camera and microphone
   are allowed for Teams up front.
 
+## Look
+
+The Teams window has a libadwaita-style frame in light or dark, following
+your desktop's preference. The AppImage bundles
+[adw-gtk3](https://github.com/lassekongo83/adw-gtk3) (libadwaita's look for
+GTK 3) and has Chrome draw its window frame with it.
+
+- The light/dark choice is read from the desktop portal's `color-scheme`
+  setting when Chrome starts; restart Chatter after switching.
+- The window buttons follow GTK's `gtk-decoration-layout` setting, like
+  any GTK or libadwaita app. With no setting, that's GNOME's close button
+  only.
+- `CHATTER_GTK_THEME=<name>` uses another GTK theme for the frame.
+
 ## Install
 
 1. Download `Chatter-<version>-x86_64.AppImage` from

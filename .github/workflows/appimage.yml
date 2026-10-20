@@ -28,6 +28,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      # (npm: Dart Sass, for the adw-gtk3 theme)
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       # Qt's xcb and Wayland plugins need these at freeze time, so that
       # PyInstaller bundles the ones not every desktop has (xcb-cursor, ...).
       - name: Libraries for the bundle

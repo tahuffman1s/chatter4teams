@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # Builds out/Chatter-<version>-x86_64.AppImage: the tray app (src/chatter.py)
-# frozen with PyInstaller. Chrome for Testing is not in it: Chatter downloads
-# that at its first start.
+# frozen with PyInstaller, and the adw-gtk3 theme (libadwaita's look for GTK 3,
+# which Chrome draws its window frame with). Chrome for Testing is not in it:
+# Chatter downloads that at its first start.
 #
 #   VERSION  the app version (default: __version__ in src/chatter.py)
 #   PYTHON   the Python to build with (default: python3)
+#
+# It needs git, curl, readelf and npm (for Dart Sass, which adw-gtk3 is
+# written for).
 #
 # Chrome for Testing is built for x86_64 Linux only, so the AppImage is too.
 set -euo pipefail
@@ -15,6 +19,8 @@ PYTHON=${PYTHON:-python3}
 BUILD=build
 APPDIR=$BUILD/AppDir
 OUT=out
+ADW_GTK3_VERSION=v6.5
+SASS_VERSION=1.105.2
 APPIMAGETOOL_URL=https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
 UPDATE_INFO="gh-releases-zsync|tahuffman1s|chatter4teams|latest|Chatter-*-x86_64.AppImage.zsync"
 
@@ -34,6 +40,26 @@ sed "s/^__version__ = .*/__version__ = \"$VERSION\"/" src/chatter.py > "$BUILD/c
 mkdir -p "$APPDIR/usr/lib"
 cp -a "$BUILD/dist/chatter" "$APPDIR/usr/lib/chatter"
 "$BUILD/venv/bin/python" packaging/prune.py "$APPDIR/usr/lib/chatter"
+
+# -- adw-gtk3, built from its source (only GTK 3's part is needed)
+adw=$BUILD/adw-gtk3-$ADW_GTK3_VERSION
+if [ ! -d "$adw/install/share/themes/adw-gtk3" ]; then
+  rm -rf "$adw"
+  git clone -q --depth 1 --branch "$ADW_GTK3_VERSION" https://github.com/lassekongo83/adw-gtk3 "$adw/src"
+  npm install --silent --prefix "$adw/sass" "sass@$SASS_VERSION"
+  "$BUILD/venv/bin/pip" install -q meson ninja
+  (
+    export PATH="$PWD/$adw/sass/node_modules/.bin:$PWD/$BUILD/venv/bin:$PATH"
+    meson setup --prefix "$PWD/$adw/install" "$adw/build" "$adw/src" >/dev/null
+    ninja -C "$adw/build" install >/dev/null
+  )
+fi
+for theme in adw-gtk3 adw-gtk3-dark; do
+  mkdir -p "$APPDIR/usr/share/themes/$theme"
+  cp -a "$adw/install/share/themes/$theme/index.theme" "$adw/install/share/themes/$theme/gtk-3.0" \
+    "$APPDIR/usr/share/themes/$theme/"
+done
+install -Dm644 "$adw/src/LICENSE" "$APPDIR/usr/share/licenses/adw-gtk3/LICENSE"
 
 # -- the AppDir
 install -m755 packaging/AppRun "$APPDIR/AppRun"
